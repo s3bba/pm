@@ -359,6 +359,188 @@ enum AttachAction {
 enum SlashCommand {
     RestartAll,
     RestartService(String),
+    StopAll,
+    StopService(String),
+    StartAll,
+    StartService(String),
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SlashArgKind {
+    None,
+    Service,
+}
+
+const COMMAND_ALIASES: &[(&str, SlashArgKind)] = &[
+    ("ra", SlashArgKind::None),
+    ("restart-all", SlashArgKind::None),
+    ("r", SlashArgKind::Service),
+    ("restart", SlashArgKind::Service),
+    ("stop-all", SlashArgKind::None),
+    ("stop", SlashArgKind::Service),
+    ("start-all", SlashArgKind::None),
+    ("start", SlashArgKind::Service),
+];
+
+fn autocomplete_colon_input(
+    buffer: &str,
+    services: &BTreeMap<String, ServiceSnapshot>,
+) -> Option<String> {
+    let tail = buffer.strip_prefix(':')?;
+    let command_end = tail
+        .find(|character: char| character.is_whitespace())
+        .unwrap_or(tail.len());
+    let command = &tail[..command_end];
+    let rest = &tail[command_end..];
+
+    if rest.is_empty() {
+        return autocomplete_command_only(command);
+    }
+
+    let mut completed_command = command.to_owned();
+    let arg_kind = match command_arg_kind(command) {
+        Some(arg_kind) => arg_kind,
+        None => {
+            let completion = complete_token(command, command_candidates(command))?;
+            if completion == command {
+                return None;
+            }
+            completed_command = completion;
+            command_arg_kind(&completed_command)?
+        }
+    };
+
+    if completed_command != command {
+        return Some(format!(":{completed_command}{rest}"));
+    }
+
+    match arg_kind {
+        SlashArgKind::None => None,
+        SlashArgKind::Service => autocomplete_service_argument(command, rest, services),
+    }
+}
+
+fn autocomplete_command_only(command: &str) -> Option<String> {
+    if matches!(command_arg_kind(command), Some(SlashArgKind::Service)) {
+        return Some(format!(":{command} "));
+    }
+    if command_arg_kind(command).is_some() {
+        return None;
+    }
+
+    let completion = complete_token(command, command_candidates(command))?;
+    if completion == command {
+        None
+    } else if matches!(command_arg_kind(&completion), Some(SlashArgKind::Service)) {
+        Some(format!(":{completion} "))
+    } else {
+        Some(format!(":{completion}"))
+    }
+}
+
+fn autocomplete_service_argument(
+    command: &str,
+    rest: &str,
+    services: &BTreeMap<String, ServiceSnapshot>,
+) -> Option<String> {
+    let argument_start = rest
+        .find(|character: char| !character.is_whitespace())
+        .unwrap_or(rest.len());
+    let spacing = &rest[..argument_start];
+    let arguments = &rest[argument_start..];
+
+    if arguments.is_empty() {
+        let completion = complete_token("", service_candidates("", services))?;
+        if completion.is_empty() {
+            return None;
+        }
+        let unique = service_candidates(&completion, services)
+            .into_iter()
+            .all(|name| name == completion);
+        let suffix = if unique { " " } else { "" };
+        return Some(format!(":{command}{spacing}{completion}{suffix}"));
+    }
+
+    if arguments.chars().last().is_some_and(char::is_whitespace)
+        || arguments.contains(char::is_whitespace)
+    {
+        return None;
+    }
+
+    let completion = complete_token(arguments, service_candidates(arguments, services))?;
+    if completion == arguments {
+        let unique = service_candidates(arguments, services)
+            .into_iter()
+            .all(|name| name == arguments);
+        if unique {
+            Some(format!(":{command}{spacing}{arguments} "))
+        } else {
+            None
+        }
+    } else {
+        let unique = service_candidates(&completion, services)
+            .into_iter()
+            .all(|name| name == completion);
+        let suffix = if unique { " " } else { "" };
+        Some(format!(":{command}{spacing}{completion}{suffix}"))
+    }
+}
+
+fn command_arg_kind(command: &str) -> Option<SlashArgKind> {
+    COMMAND_ALIASES
+        .iter()
+        .find_map(|(alias, arg_kind)| (*alias == command).then_some(*arg_kind))
+}
+
+fn command_candidates(prefix: &str) -> Vec<&'static str> {
+    COMMAND_ALIASES
+        .iter()
+        .map(|(alias, _)| *alias)
+        .filter(|alias| alias.starts_with(prefix))
+        .collect()
+}
+
+fn service_candidates<'a>(
+    prefix: &str,
+    services: &'a BTreeMap<String, ServiceSnapshot>,
+) -> Vec<&'a str> {
+    services
+        .keys()
+        .map(String::as_str)
+        .filter(|name| name.starts_with(prefix))
+        .collect()
+}
+
+fn complete_token<'a>(token: &str, candidates: Vec<&'a str>) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+    if candidates.len() == 1 {
+        return Some(candidates[0].to_owned());
+    }
+
+    let prefix = longest_common_prefix(&candidates);
+    (prefix.len() > token.len()).then_some(prefix)
+}
+
+fn longest_common_prefix(candidates: &[&str]) -> String {
+    let Some(first) = candidates.first() else {
+        return String::new();
+    };
+    let mut prefix = (*first).to_owned();
+    for candidate in &candidates[1..] {
+        let shared_len = prefix
+            .chars()
+            .zip(candidate.chars())
+            .take_while(|(left, right)| left == right)
+            .map(|(character, _)| character.len_utf8())
+            .sum();
+        prefix.truncate(shared_len);
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix
 }
 
 fn status_lines(
@@ -548,6 +730,12 @@ async fn handle_command_key(
                 terminal.draw_command_prompt(services, buffer)?;
             }
         }
+        KeyCode::Tab => {
+            if let Some(completed) = autocomplete_colon_input(buffer, services) {
+                *buffer = completed;
+                terminal.draw_command_prompt(services, buffer)?;
+            }
+        }
         KeyCode::Enter => {
             let command_input = buffer.trim().to_owned();
             buffer.clear();
@@ -603,6 +791,28 @@ fn parse_colon_command(input: &str) -> Result<SlashCommand> {
             (None, None) => bail!("`:{name}` requires a service name"),
             _ => bail!("`:{name}` accepts exactly one service name"),
         },
+        "stop-all" => {
+            if parts.next().is_some() {
+                bail!("`:{name}` does not take arguments");
+            }
+            Ok(SlashCommand::StopAll)
+        }
+        "stop" => match (parts.next(), parts.next()) {
+            (Some(service), None) => Ok(SlashCommand::StopService(service.to_owned())),
+            (None, None) => bail!("`:{name}` requires a service name"),
+            _ => bail!("`:{name}` accepts exactly one service name"),
+        },
+        "start-all" => {
+            if parts.next().is_some() {
+                bail!("`:{name}` does not take arguments");
+            }
+            Ok(SlashCommand::StartAll)
+        }
+        "start" => match (parts.next(), parts.next()) {
+            (Some(service), None) => Ok(SlashCommand::StartService(service.to_owned())),
+            (None, None) => bail!("`:{name}` requires a service name"),
+            _ => bail!("`:{name}` accepts exactly one service name"),
+        },
         _ => bail!("unknown command `:{name}`"),
     }
 }
@@ -615,6 +825,20 @@ async fn execute_slash_command(socket_path: &Path, command: SlashCommand) -> Res
         SlashCommand::RestartService(service) => ClientMessage::ProcessAction {
             service,
             action: ProcessAction::Restart,
+        },
+        SlashCommand::StopAll => ClientMessage::AllAction {
+            action: ProcessAction::Stop,
+        },
+        SlashCommand::StopService(service) => ClientMessage::ProcessAction {
+            service,
+            action: ProcessAction::Stop,
+        },
+        SlashCommand::StartAll => ClientMessage::AllAction {
+            action: ProcessAction::Start,
+        },
+        SlashCommand::StartService(service) => ClientMessage::ProcessAction {
+            service,
+            action: ProcessAction::Start,
         },
     };
     match request_response(socket_path, &message).await? {
@@ -659,8 +883,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        SlashCommand, format_log_prefix, format_memory, parse_colon_command, service_rows_for,
-        status_label, status_lines, status_width,
+        SlashCommand, autocomplete_colon_input, format_log_prefix, format_memory,
+        parse_colon_command, service_rows_for, status_label, status_lines, status_width,
     };
     use crate::ipc::{ServiceSnapshot, ServiceState};
 
@@ -694,6 +918,110 @@ mod tests {
             parse_colon_command(":restart forge_web").unwrap(),
             SlashCommand::RestartService("forge_web".to_owned())
         );
+    }
+
+    #[test]
+    fn parses_start_and_stop_commands() {
+        assert_eq!(
+            parse_colon_command(":start-all").unwrap(),
+            SlashCommand::StartAll
+        );
+        assert_eq!(
+            parse_colon_command(":start forge_web").unwrap(),
+            SlashCommand::StartService("forge_web".to_owned())
+        );
+        assert_eq!(
+            parse_colon_command(":stop-all").unwrap(),
+            SlashCommand::StopAll
+        );
+        assert_eq!(
+            parse_colon_command(":stop forge_web").unwrap(),
+            SlashCommand::StopService("forge_web".to_owned())
+        );
+    }
+
+    #[test]
+    fn autocompletes_command_names() {
+        let services = BTreeMap::new();
+        assert_eq!(
+            autocomplete_colon_input(":re", &services),
+            Some(":restart ".to_owned())
+        );
+        assert_eq!(
+            autocomplete_colon_input(":restart-a", &services),
+            Some(":restart-all".to_owned())
+        );
+        assert_eq!(
+            autocomplete_colon_input(":start-a", &services),
+            Some(":start-all".to_owned())
+        );
+        assert_eq!(
+            autocomplete_colon_input(":stop-a", &services),
+            Some(":stop-all".to_owned())
+        );
+    }
+
+    #[test]
+    fn adds_space_after_exact_restart_command() {
+        let services = BTreeMap::new();
+        assert_eq!(
+            autocomplete_colon_input(":r", &services),
+            Some(":r ".to_owned())
+        );
+        assert_eq!(
+            autocomplete_colon_input(":start", &services),
+            Some(":start ".to_owned())
+        );
+        assert_eq!(
+            autocomplete_colon_input(":stop", &services),
+            Some(":stop ".to_owned())
+        );
+    }
+
+    #[test]
+    fn autocompletes_restart_service_argument() {
+        let services = BTreeMap::from([
+            (
+                "api".to_owned(),
+                sample_service("api", ServiceState::Running),
+            ),
+            (
+                "worker".to_owned(),
+                sample_service("worker", ServiceState::Running),
+            ),
+        ]);
+
+        assert_eq!(
+            autocomplete_colon_input(":r wo", &services),
+            Some(":r worker ".to_owned())
+        );
+        assert_eq!(
+            autocomplete_colon_input(":start wo", &services),
+            Some(":start worker ".to_owned())
+        );
+        assert_eq!(
+            autocomplete_colon_input(":stop wo", &services),
+            Some(":stop worker ".to_owned())
+        );
+        assert_eq!(autocomplete_colon_input(":restart ", &services), None);
+
+        let single_service = BTreeMap::from([(
+            "api".to_owned(),
+            sample_service("api", ServiceState::Running),
+        )]);
+        assert_eq!(
+            autocomplete_colon_input(":restart ", &single_service),
+            Some(":restart api ".to_owned())
+        );
+    }
+
+    #[test]
+    fn does_not_complete_when_second_argument_is_present() {
+        let services = BTreeMap::from([(
+            "api".to_owned(),
+            sample_service("api", ServiceState::Running),
+        )]);
+        assert_eq!(autocomplete_colon_input(":r api extra", &services), None);
     }
 
     #[test]
