@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use crossterm::{
-    cursor::{Hide, MoveTo, RestorePosition, SavePosition, Show},
+    cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute, queue,
     style::{Color, Print, ResetColor, SetForegroundColor},
@@ -301,7 +301,6 @@ impl AttachTerminal {
             self.max_name_width,
         );
 
-        queue!(self.stdout, SavePosition)?;
         self.clear_footer()?;
 
         for (index, line) in status_lines.iter().enumerate() {
@@ -329,16 +328,20 @@ impl AttachTerminal {
 
         if let Some(buffer) = prompt {
             let command_row = self.command_row();
+            let (prompt_text, cursor_column) = render_command_prompt(buffer, self.columns as usize);
             queue!(
                 self.stdout,
                 MoveTo(0, command_row),
                 SetForegroundColor(Color::White),
-                Print(render_command_prompt(buffer, self.columns as usize)),
-                ResetColor
+                Print(prompt_text),
+                ResetColor,
+                MoveTo(cursor_column as u16, command_row),
+                Show
             )?;
+        } else {
+            queue!(self.stdout, Hide)?;
         }
 
-        queue!(self.stdout, RestorePosition)?;
         self.stdout.flush()?;
         Ok(())
     }
@@ -907,28 +910,19 @@ fn truncate_ascii(value: &str, max_len: usize) -> String {
     value.chars().take(max_len).collect()
 }
 
-fn render_command_prompt(buffer: &str, max_len: usize) -> String {
-    render_cursor_buffer(buffer, buffer.chars().count(), max_len)
-}
-
-fn render_cursor_buffer(buffer: &str, cursor_index: usize, max_len: usize) -> String {
+fn render_command_prompt(buffer: &str, max_len: usize) -> (String, usize) {
     if max_len == 0 {
-        return String::new();
+        return (String::new(), 0);
     }
 
     let characters = buffer.chars().collect::<Vec<_>>();
-    let cursor_index = cursor_index.min(characters.len());
-    let mut display = Vec::with_capacity(characters.len() + 1);
-    display.extend_from_slice(&characters[..cursor_index]);
-    display.push('|');
-    display.extend_from_slice(&characters[cursor_index..]);
-
-    if display.len() <= max_len {
-        return display.into_iter().collect();
+    let visible_len = max_len.saturating_sub(1);
+    if characters.len() <= visible_len {
+        return (buffer.to_owned(), characters.len());
     }
 
-    let start = (cursor_index + 1).saturating_sub(max_len);
-    display[start..start + max_len].iter().collect()
+    let start = characters.len().saturating_sub(visible_len);
+    (characters[start..].iter().collect(), visible_len)
 }
 
 fn service_rows_for(rows: u16, service_count: usize) -> u16 {
@@ -1210,8 +1204,7 @@ mod tests {
     use super::{
         SERVICE_NAME_COLOR, SERVICE_SHORT_NAME_COLOR, ServiceNames, SlashCommand,
         autocomplete_colon_input, format_log_prefix, format_memory, parse_colon_command,
-        render_command_prompt, render_cursor_buffer, service_rows_for, status_label, status_lines,
-        status_width,
+        render_command_prompt, service_rows_for, status_label, status_lines, status_width,
     };
     use crate::ipc::{ServiceSnapshot, ServiceState};
     use crossterm::style::Color;
@@ -1230,9 +1223,11 @@ mod tests {
 
     #[test]
     fn renders_command_prompt_cursor() {
-        assert_eq!(render_command_prompt(":r fw", 32), ":r fw|");
-        assert_eq!(render_cursor_buffer(":restart", 8, 8), "restart|");
-        assert_eq!(render_command_prompt(":restart forge_web", 8), "rge_web|");
+        assert_eq!(render_command_prompt(":r fw", 32), (":r fw".to_owned(), 5));
+        assert_eq!(
+            render_command_prompt(":restart forge_web", 8),
+            ("rge_web".to_owned(), 7)
+        );
     }
 
     #[test]
