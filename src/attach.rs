@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{Stdout, Write, stdout},
     path::Path,
     time::Duration,
@@ -26,6 +26,8 @@ use crate::ipc::{
 
 const COMMAND_ROW_HEIGHT: u16 = 1;
 const MIN_ATTACH_ROWS: u16 = 3;
+const SERVICE_NAME_COLOR: Color = Color::DarkGrey;
+const SERVICE_SHORT_NAME_COLOR: Color = Color::Magenta;
 
 pub async fn run(socket_path: &Path) -> Result<()> {
     let stream = UnixStream::connect(socket_path)
@@ -49,16 +51,18 @@ pub async fn run(socket_path: &Path) -> Result<()> {
         other => bail!("unexpected response from manager: {other:?}"),
     };
 
-    let mut terminal = AttachTerminal::new(max_name_width, services.len())?;
     let mut service_map = services
         .into_iter()
         .map(|service| (service.name.clone(), service))
         .collect::<BTreeMap<_, _>>();
+    let service_count = service_map.len();
+    let service_names = ServiceNames::from_services(&service_map);
+    let mut terminal = AttachTerminal::new(max_name_width, service_count)?;
 
     for entry in recent_logs {
-        terminal.print_log(&entry)?;
+        terminal.print_log(&entry, &service_names)?;
     }
-    terminal.draw_status(&service_map)?;
+    terminal.draw_status(&service_map, &service_names)?;
 
     let mut input_events = spawn_input_reader();
     let mut input_mode = InputMode::Status;
@@ -77,6 +81,7 @@ pub async fn run(socket_path: &Path) -> Result<()> {
                     &mut input_mode,
                     &mut terminal,
                     &service_map,
+                    &service_names,
                     socket_path,
                 ).await? {
                     AttachAction::Continue => {}
@@ -89,17 +94,17 @@ pub async fn run(socket_path: &Path) -> Result<()> {
                 };
                 match message {
                     ServerMessage::Log { entry } => {
-                        terminal.print_log(&entry)?;
+                        terminal.print_log(&entry, &service_names)?;
                         if let InputMode::Command(buffer) = &input_mode {
-                            terminal.draw_command_prompt(&service_map, buffer)?;
+                            terminal.draw_command_prompt(&service_map, &service_names, buffer)?;
                         }
                     }
                     ServerMessage::ServiceUpdate { service } => {
                         service_map.insert(service.name.clone(), service);
                         match &input_mode {
-                            InputMode::Status => terminal.draw_status(&service_map)?,
+                            InputMode::Status => terminal.draw_status(&service_map, &service_names)?,
                             InputMode::Command(buffer) => {
-                                terminal.draw_command_prompt(&service_map, buffer)?
+                                terminal.draw_command_prompt(&service_map, &service_names, buffer)?
                             }
                         }
                     }
@@ -155,34 +160,47 @@ impl AttachTerminal {
         Ok(terminal)
     }
 
-    fn print_log(&mut self, entry: &LogEntry) -> Result<()> {
+    fn print_log(&mut self, entry: &LogEntry, service_names: &ServiceNames) -> Result<()> {
         self.refresh_size()?;
         let log_bottom = self.log_bottom_row();
-        let prefix = format_log_prefix(&entry.service, self.max_name_width);
         queue!(
             self.stdout,
             MoveTo(0, log_bottom),
-            Clear(ClearType::CurrentLine),
-            SetForegroundColor(Color::DarkGrey),
-            Print(prefix),
-            ResetColor,
-            Print(&entry.line),
-            Print("\n")
+            Clear(ClearType::CurrentLine)
         )?;
+        for segment in format_log_prefix_segments(
+            &entry.service,
+            service_names.short_name(&entry.service),
+            self.max_name_width,
+        ) {
+            if let Some(color) = segment.color {
+                queue!(self.stdout, SetForegroundColor(color))?;
+            }
+            queue!(self.stdout, Print(segment.text))?;
+            if segment.color.is_some() {
+                queue!(self.stdout, ResetColor)?;
+            }
+        }
+        queue!(self.stdout, Print(&entry.line), Print("\n"))?;
         self.stdout.flush()?;
         Ok(())
     }
 
-    fn draw_status(&mut self, services: &BTreeMap<String, ServiceSnapshot>) -> Result<()> {
-        self.draw_footer(services, None)
+    fn draw_status(
+        &mut self,
+        services: &BTreeMap<String, ServiceSnapshot>,
+        service_names: &ServiceNames,
+    ) -> Result<()> {
+        self.draw_footer(services, service_names, None)
     }
 
     fn draw_command_prompt(
         &mut self,
         services: &BTreeMap<String, ServiceSnapshot>,
+        service_names: &ServiceNames,
         buffer: &str,
     ) -> Result<()> {
-        self.draw_footer(services, Some(buffer))
+        self.draw_footer(services, service_names, Some(buffer))
     }
 
     fn restore(&mut self) -> Result<()> {
@@ -270,12 +288,18 @@ impl AttachTerminal {
     fn draw_footer(
         &mut self,
         services: &BTreeMap<String, ServiceSnapshot>,
+        service_names: &ServiceNames,
         prompt: Option<&str>,
     ) -> Result<()> {
         self.update_service_count(services.len())?;
         self.refresh_size()?;
         let status_row = self.status_start_row();
-        let status_lines = status_lines(services, self.service_rows as usize, self.max_name_width);
+        let status_lines = status_lines(
+            services,
+            service_names,
+            self.service_rows as usize,
+            self.max_name_width,
+        );
 
         queue!(self.stdout, SavePosition)?;
         self.clear_footer()?;
@@ -309,7 +333,7 @@ impl AttachTerminal {
                 self.stdout,
                 MoveTo(0, command_row),
                 SetForegroundColor(Color::White),
-                Print(truncate_ascii(buffer, self.columns as usize)),
+                Print(render_command_prompt(buffer, self.columns as usize)),
                 ResetColor
             )?;
         }
@@ -382,10 +406,177 @@ const COMMAND_ALIASES: &[(&str, SlashArgKind)] = &[
     ("start", SlashArgKind::Service),
 ];
 
-fn autocomplete_colon_input(
-    buffer: &str,
-    services: &BTreeMap<String, ServiceSnapshot>,
-) -> Option<String> {
+#[derive(Debug, Clone)]
+struct ServiceNames {
+    short_by_full: BTreeMap<String, String>,
+    full_by_short: BTreeMap<String, String>,
+}
+
+impl ServiceNames {
+    fn from_services(services: &BTreeMap<String, ServiceSnapshot>) -> Self {
+        Self::from_names(services.keys().map(String::as_str))
+    }
+
+    fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+        let names = names.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let short_by_full = build_service_short_names(&names);
+        let full_by_short = short_by_full
+            .iter()
+            .map(|(full_name, short_name)| (short_name.clone(), full_name.clone()))
+            .collect();
+        Self {
+            short_by_full,
+            full_by_short,
+        }
+    }
+
+    fn short_name<'a>(&'a self, full_name: &str) -> &'a str {
+        self.short_by_full
+            .get(full_name)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    fn resolve<'a>(&'a self, token: &str) -> Option<&'a str> {
+        if let Some((full_name, _)) = self.short_by_full.get_key_value(token) {
+            Some(full_name.as_str())
+        } else {
+            self.full_by_short.get(token).map(String::as_str)
+        }
+    }
+
+    fn candidates<'a>(&'a self, prefix: &str) -> Vec<&'a str> {
+        let short_matches = self
+            .full_by_short
+            .keys()
+            .map(String::as_str)
+            .filter(|candidate| candidate.starts_with(prefix))
+            .collect::<Vec<_>>();
+        if !short_matches.is_empty()
+            && !prefix.chars().any(|character| !character.is_alphanumeric())
+        {
+            return short_matches;
+        }
+
+        let full_matches = self
+            .short_by_full
+            .keys()
+            .map(String::as_str)
+            .filter(|candidate| candidate.starts_with(prefix))
+            .collect::<Vec<_>>();
+        if full_matches.is_empty() {
+            short_matches
+        } else {
+            full_matches
+        }
+    }
+}
+
+fn build_service_short_names(names: &[String]) -> BTreeMap<String, String> {
+    let signatures = names
+        .iter()
+        .map(|name| (name.clone(), service_short_name_signature(name, names)))
+        .collect::<BTreeMap<_, _>>();
+    let full_names = names.iter().map(String::as_str).collect::<BTreeSet<_>>();
+
+    names
+        .iter()
+        .map(|name| {
+            let short_name =
+                shortest_unique_short_name(name, &signatures[name], &signatures, &full_names);
+            (name.clone(), short_name)
+        })
+        .collect()
+}
+
+fn service_short_name_signature(service_name: &str, all_names: &[String]) -> String {
+    let Some((first_index, first_character)) = first_service_name_character(service_name) else {
+        return String::new();
+    };
+    let first_character_end = first_index + first_character.len_utf8();
+    let shared_prefix_len = all_names
+        .iter()
+        .filter(|other_name| other_name.as_str() != service_name)
+        .map(|other_name| longest_common_prefix_len(service_name, other_name))
+        .max()
+        .unwrap_or(0);
+
+    let suffix_source = if shared_prefix_len > 0 {
+        let distinctive_suffix = trim_leading_non_alphanumeric(&service_name[shared_prefix_len..]);
+        if distinctive_suffix.is_empty() {
+            &service_name[first_character_end..]
+        } else {
+            distinctive_suffix
+        }
+    } else {
+        &service_name[first_character_end..]
+    };
+
+    let mut signature = first_character.to_string();
+    signature.push_str(&sanitize_short_name_fragment(suffix_source));
+    signature
+}
+
+fn shortest_unique_short_name(
+    service_name: &str,
+    signature: &str,
+    signatures: &BTreeMap<String, String>,
+    full_names: &BTreeSet<&str>,
+) -> String {
+    let mut candidate = String::new();
+    for character in signature.chars() {
+        candidate.push(character);
+
+        let conflicts_with_full_name =
+            candidate != service_name && full_names.contains(candidate.as_str());
+        let conflicts_with_other_signature = candidate != service_name
+            && signatures.iter().any(|(other_name, other_signature)| {
+                other_name != service_name && other_signature.starts_with(&candidate)
+            });
+        if !conflicts_with_full_name && !conflicts_with_other_signature {
+            return candidate;
+        }
+    }
+
+    service_name.to_owned()
+}
+
+fn first_service_name_character(service_name: &str) -> Option<(usize, char)> {
+    service_name
+        .char_indices()
+        .find(|(_, character)| character.is_alphanumeric())
+        .or_else(|| service_name.char_indices().next())
+}
+
+fn longest_common_prefix_len(left: &str, right: &str) -> usize {
+    let mut matched_bytes = 0;
+    for ((index, left_character), right_character) in left.char_indices().zip(right.chars()) {
+        if left_character != right_character {
+            break;
+        }
+        matched_bytes = index + left_character.len_utf8();
+    }
+    matched_bytes
+}
+
+fn trim_leading_non_alphanumeric(value: &str) -> &str {
+    let Some((index, _)) = value
+        .char_indices()
+        .find(|(_, character)| character.is_alphanumeric())
+    else {
+        return "";
+    };
+    &value[index..]
+}
+
+fn sanitize_short_name_fragment(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .collect()
+}
+
+fn autocomplete_colon_input(buffer: &str, service_names: &ServiceNames) -> Option<String> {
     let tail = buffer.strip_prefix(':')?;
     let command_end = tail
         .find(|character: char| character.is_whitespace())
@@ -416,7 +607,7 @@ fn autocomplete_colon_input(
 
     match arg_kind {
         SlashArgKind::None => None,
-        SlashArgKind::Service => autocomplete_service_argument(command, rest, services),
+        SlashArgKind::Service => autocomplete_service_argument(command, rest, service_names),
     }
 }
 
@@ -441,7 +632,7 @@ fn autocomplete_command_only(command: &str) -> Option<String> {
 fn autocomplete_service_argument(
     command: &str,
     rest: &str,
-    services: &BTreeMap<String, ServiceSnapshot>,
+    service_names: &ServiceNames,
 ) -> Option<String> {
     let argument_start = rest
         .find(|character: char| !character.is_whitespace())
@@ -450,11 +641,12 @@ fn autocomplete_service_argument(
     let arguments = &rest[argument_start..];
 
     if arguments.is_empty() {
-        let completion = complete_token("", service_candidates("", services))?;
+        let completion = complete_token("", service_names.candidates(""))?;
         if completion.is_empty() {
             return None;
         }
-        let unique = service_candidates(&completion, services)
+        let unique = service_names
+            .candidates(&completion)
             .into_iter()
             .all(|name| name == completion);
         let suffix = if unique { " " } else { "" };
@@ -467,9 +659,10 @@ fn autocomplete_service_argument(
         return None;
     }
 
-    let completion = complete_token(arguments, service_candidates(arguments, services))?;
+    let completion = complete_token(arguments, service_names.candidates(arguments))?;
     if completion == arguments {
-        let unique = service_candidates(arguments, services)
+        let unique = service_names
+            .candidates(arguments)
             .into_iter()
             .all(|name| name == arguments);
         if unique {
@@ -478,7 +671,8 @@ fn autocomplete_service_argument(
             None
         }
     } else {
-        let unique = service_candidates(&completion, services)
+        let unique = service_names
+            .candidates(&completion)
             .into_iter()
             .all(|name| name == completion);
         let suffix = if unique { " " } else { "" };
@@ -497,17 +691,6 @@ fn command_candidates(prefix: &str) -> Vec<&'static str> {
         .iter()
         .map(|(alias, _)| *alias)
         .filter(|alias| alias.starts_with(prefix))
-        .collect()
-}
-
-fn service_candidates<'a>(
-    prefix: &str,
-    services: &'a BTreeMap<String, ServiceSnapshot>,
-) -> Vec<&'a str> {
-    services
-        .keys()
-        .map(String::as_str)
-        .filter(|name| name.starts_with(prefix))
         .collect()
 }
 
@@ -545,6 +728,7 @@ fn longest_common_prefix(candidates: &[&str]) -> String {
 
 fn status_lines(
     services: &BTreeMap<String, ServiceSnapshot>,
+    service_names: &ServiceNames,
     max_lines: usize,
     name_width: usize,
 ) -> Vec<StatusLine> {
@@ -566,27 +750,27 @@ fn status_lines(
     let mut lines = services
         .values()
         .take(visible_services)
-        .map(|service| StatusLine {
-            segments: vec![
-                StatusSegment {
-                    text: format!(
-                        "{:width$} {:name_width$} ",
-                        status_label(service),
-                        service.name,
-                        width = status_width(),
-                        name_width = name_width
-                    ),
-                    color: Some(state_color(service)),
-                },
-                StatusSegment {
-                    text: format!(
-                        "{:>5.1}% {}",
-                        service.cpu_percent,
-                        format_memory(service.memory_bytes)
-                    ),
-                    color: Some(Color::DarkGrey),
-                },
-            ],
+        .map(|service| {
+            let mut segments = vec![StatusSegment {
+                text: format!("{:width$} ", status_label(service), width = status_width()),
+                color: Some(state_color(service)),
+            }];
+            segments.extend(service_name_segments(
+                &service.name,
+                service_names.short_name(&service.name),
+                0,
+                name_width.saturating_sub(service.name.len()),
+                " ",
+            ));
+            segments.push(StatusSegment {
+                text: format!(
+                    "{:>5.1}% {}",
+                    service.cpu_percent,
+                    format_memory(service.memory_bytes)
+                ),
+                color: Some(Color::DarkGrey),
+            });
+            StatusLine { segments }
         })
         .collect::<Vec<_>>();
 
@@ -630,8 +814,121 @@ pub fn format_log_prefix(service_name: &str, max_name_width: usize) -> String {
     format!("{padding}{service_name}>  ")
 }
 
+fn format_log_prefix_segments(
+    service_name: &str,
+    short_name: &str,
+    max_name_width: usize,
+) -> Vec<StatusSegment> {
+    service_name_segments(
+        service_name,
+        short_name,
+        max_name_width.saturating_sub(service_name.len()),
+        0,
+        ">  ",
+    )
+}
+
+fn service_name_segments(
+    service_name: &str,
+    short_name: &str,
+    left_padding: usize,
+    right_padding: usize,
+    suffix: &str,
+) -> Vec<StatusSegment> {
+    let mut segments = Vec::new();
+    if left_padding > 0 {
+        segments.push(StatusSegment {
+            text: " ".repeat(left_padding),
+            color: Some(SERVICE_NAME_COLOR),
+        });
+    }
+
+    let highlighted_characters = highlighted_service_name_characters(service_name, short_name);
+    let mut current_color = Some(SERVICE_NAME_COLOR);
+    let mut current_text = String::new();
+
+    for (index, character) in service_name.chars().enumerate() {
+        let color = Some(if highlighted_characters[index] {
+            SERVICE_SHORT_NAME_COLOR
+        } else {
+            SERVICE_NAME_COLOR
+        });
+        if !current_text.is_empty() && color != current_color {
+            segments.push(StatusSegment {
+                text: std::mem::take(&mut current_text),
+                color: current_color,
+            });
+        }
+        current_color = color;
+        current_text.push(character);
+    }
+    if !current_text.is_empty() {
+        segments.push(StatusSegment {
+            text: current_text,
+            color: current_color,
+        });
+    }
+
+    if right_padding > 0 {
+        segments.push(StatusSegment {
+            text: " ".repeat(right_padding),
+            color: Some(SERVICE_NAME_COLOR),
+        });
+    }
+    if !suffix.is_empty() {
+        segments.push(StatusSegment {
+            text: suffix.to_owned(),
+            color: Some(SERVICE_NAME_COLOR),
+        });
+    }
+
+    segments
+}
+
+fn highlighted_service_name_characters(service_name: &str, short_name: &str) -> Vec<bool> {
+    let mut highlighted = vec![false; service_name.chars().count()];
+    let mut short_characters = short_name.chars();
+    let mut next_short_character = short_characters.next();
+
+    for (index, character) in service_name.chars().enumerate() {
+        let Some(short_character) = next_short_character else {
+            break;
+        };
+        if short_character == character {
+            highlighted[index] = true;
+            next_short_character = short_characters.next();
+        }
+    }
+
+    highlighted
+}
+
 fn truncate_ascii(value: &str, max_len: usize) -> String {
     value.chars().take(max_len).collect()
+}
+
+fn render_command_prompt(buffer: &str, max_len: usize) -> String {
+    render_cursor_buffer(buffer, buffer.chars().count(), max_len)
+}
+
+fn render_cursor_buffer(buffer: &str, cursor_index: usize, max_len: usize) -> String {
+    if max_len == 0 {
+        return String::new();
+    }
+
+    let characters = buffer.chars().collect::<Vec<_>>();
+    let cursor_index = cursor_index.min(characters.len());
+    let mut display = Vec::with_capacity(characters.len() + 1);
+    display.extend_from_slice(&characters[..cursor_index]);
+    display.push('|');
+    display.extend_from_slice(&characters[cursor_index..]);
+
+    if display.len() <= max_len {
+        return display.into_iter().collect();
+    }
+
+    let start = (cursor_index + 1).saturating_sub(max_len);
+    display[start..start + max_len].iter().collect()
 }
 
 fn service_rows_for(rows: u16, service_count: usize) -> u16 {
@@ -672,6 +969,7 @@ async fn handle_input_event(
     input_mode: &mut InputMode,
     terminal: &mut AttachTerminal,
     services: &BTreeMap<String, ServiceSnapshot>,
+    service_names: &ServiceNames,
     socket_path: &Path,
 ) -> Result<AttachAction> {
     match event {
@@ -684,9 +982,19 @@ async fn handle_input_event(
             }
 
             match input_mode {
-                InputMode::Status => handle_status_key(key_event, input_mode, terminal, services),
+                InputMode::Status => {
+                    handle_status_key(key_event, input_mode, terminal, services, service_names)
+                }
                 InputMode::Command(buffer) => {
-                    handle_command_key(key_event, buffer, terminal, services, socket_path).await?;
+                    handle_command_key(
+                        key_event,
+                        buffer,
+                        terminal,
+                        services,
+                        service_names,
+                        socket_path,
+                    )
+                    .await?;
                     if buffer.is_empty() {
                         *input_mode = InputMode::Status;
                     }
@@ -702,10 +1010,11 @@ fn handle_status_key(
     input_mode: &mut InputMode,
     terminal: &mut AttachTerminal,
     services: &BTreeMap<String, ServiceSnapshot>,
+    service_names: &ServiceNames,
 ) -> Result<AttachAction> {
     if matches!(key_event.code, KeyCode::Char(':')) {
         *input_mode = InputMode::Command(":".to_owned());
-        terminal.draw_command_prompt(services, ":")?;
+        terminal.draw_command_prompt(services, service_names, ":")?;
     }
     Ok(AttachAction::Continue)
 }
@@ -715,53 +1024,57 @@ async fn handle_command_key(
     buffer: &mut String,
     terminal: &mut AttachTerminal,
     services: &BTreeMap<String, ServiceSnapshot>,
+    service_names: &ServiceNames,
     socket_path: &Path,
 ) -> Result<()> {
     match key_event.code {
         KeyCode::Esc => {
             buffer.clear();
-            terminal.draw_status(services)?;
+            terminal.draw_status(services, service_names)?;
         }
         KeyCode::Backspace => {
             buffer.pop();
             if buffer.is_empty() {
-                terminal.draw_status(services)?;
+                terminal.draw_status(services, service_names)?;
             } else {
-                terminal.draw_command_prompt(services, buffer)?;
+                terminal.draw_command_prompt(services, service_names, buffer)?;
             }
         }
         KeyCode::Tab => {
-            if let Some(completed) = autocomplete_colon_input(buffer, services) {
+            if let Some(completed) = autocomplete_colon_input(buffer, service_names) {
                 *buffer = completed;
-                terminal.draw_command_prompt(services, buffer)?;
+                terminal.draw_command_prompt(services, service_names, buffer)?;
             }
         }
         KeyCode::Enter => {
             let command_input = buffer.trim().to_owned();
             buffer.clear();
-            terminal.draw_status(services)?;
+            terminal.draw_status(services, service_names)?;
 
             if command_input == ":" || command_input.is_empty() {
                 return Ok(());
             }
 
-            let line = match parse_colon_command(&command_input) {
+            let line = match parse_colon_command(&command_input, service_names) {
                 Ok(command) => match execute_slash_command(socket_path, command).await {
                     Ok(message) => message,
                     Err(error) => format!("command failed: {error}"),
                 },
                 Err(error) => format!("command failed: {error}"),
             };
-            terminal.print_log(&LogEntry {
-                service: "pm".to_owned(),
-                line,
-            })?;
-            terminal.draw_status(services)?;
+            terminal.print_log(
+                &LogEntry {
+                    service: "pm".to_owned(),
+                    line,
+                },
+                service_names,
+            )?;
+            terminal.draw_status(services, service_names)?;
         }
         KeyCode::Char(character) => {
             if !key_event.modifiers.contains(KeyModifiers::CONTROL) {
                 buffer.push(character);
-                terminal.draw_command_prompt(services, buffer)?;
+                terminal.draw_command_prompt(services, service_names, buffer)?;
             }
         }
         _ => {}
@@ -769,7 +1082,7 @@ async fn handle_command_key(
     Ok(())
 }
 
-fn parse_colon_command(input: &str) -> Result<SlashCommand> {
+fn parse_colon_command(input: &str, service_names: &ServiceNames) -> Result<SlashCommand> {
     let trimmed = input.trim();
     let Some(command) = trimmed.strip_prefix(':') else {
         bail!("commands must start with `:`");
@@ -787,7 +1100,9 @@ fn parse_colon_command(input: &str) -> Result<SlashCommand> {
             Ok(SlashCommand::RestartAll)
         }
         "r" | "restart" => match (parts.next(), parts.next()) {
-            (Some(service), None) => Ok(SlashCommand::RestartService(service.to_owned())),
+            (Some(service), None) => Ok(SlashCommand::RestartService(
+                resolve_service_token(service, service_names)?.to_owned(),
+            )),
             (None, None) => bail!("`:{name}` requires a service name"),
             _ => bail!("`:{name}` accepts exactly one service name"),
         },
@@ -798,7 +1113,9 @@ fn parse_colon_command(input: &str) -> Result<SlashCommand> {
             Ok(SlashCommand::StopAll)
         }
         "stop" => match (parts.next(), parts.next()) {
-            (Some(service), None) => Ok(SlashCommand::StopService(service.to_owned())),
+            (Some(service), None) => Ok(SlashCommand::StopService(
+                resolve_service_token(service, service_names)?.to_owned(),
+            )),
             (None, None) => bail!("`:{name}` requires a service name"),
             _ => bail!("`:{name}` accepts exactly one service name"),
         },
@@ -809,12 +1126,20 @@ fn parse_colon_command(input: &str) -> Result<SlashCommand> {
             Ok(SlashCommand::StartAll)
         }
         "start" => match (parts.next(), parts.next()) {
-            (Some(service), None) => Ok(SlashCommand::StartService(service.to_owned())),
+            (Some(service), None) => Ok(SlashCommand::StartService(
+                resolve_service_token(service, service_names)?.to_owned(),
+            )),
             (None, None) => bail!("`:{name}` requires a service name"),
             _ => bail!("`:{name}` accepts exactly one service name"),
         },
         _ => bail!("unknown command `:{name}`"),
     }
+}
+
+fn resolve_service_token<'a>(token: &str, service_names: &'a ServiceNames) -> Result<&'a str> {
+    service_names
+        .resolve(token)
+        .with_context(|| format!("unknown service `{token}`"))
 }
 
 async fn execute_slash_command(socket_path: &Path, command: SlashCommand) -> Result<String> {
@@ -883,10 +1208,13 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        SlashCommand, autocomplete_colon_input, format_log_prefix, format_memory,
-        parse_colon_command, service_rows_for, status_label, status_lines, status_width,
+        SERVICE_NAME_COLOR, SERVICE_SHORT_NAME_COLOR, ServiceNames, SlashCommand,
+        autocomplete_colon_input, format_log_prefix, format_memory, parse_colon_command,
+        render_command_prompt, render_cursor_buffer, service_rows_for, status_label, status_lines,
+        status_width,
     };
     use crate::ipc::{ServiceSnapshot, ServiceState};
+    use crossterm::style::Color;
 
     #[test]
     fn aligns_log_prefixes() {
@@ -901,79 +1229,88 @@ mod tests {
     }
 
     #[test]
+    fn renders_command_prompt_cursor() {
+        assert_eq!(render_command_prompt(":r fw", 32), ":r fw|");
+        assert_eq!(render_cursor_buffer(":restart", 8, 8), "restart|");
+        assert_eq!(render_command_prompt(":restart forge_web", 8), "rge_web|");
+    }
+
+    #[test]
     fn parses_restart_commands() {
+        let service_names = ServiceNames::from_names(["forge_web"]);
         assert_eq!(
-            parse_colon_command(":ra").unwrap(),
+            parse_colon_command(":ra", &service_names).unwrap(),
             SlashCommand::RestartAll
         );
         assert_eq!(
-            parse_colon_command(":restart-all").unwrap(),
+            parse_colon_command(":restart-all", &service_names).unwrap(),
             SlashCommand::RestartAll
         );
         assert_eq!(
-            parse_colon_command(":r forge_web").unwrap(),
+            parse_colon_command(":r forge_web", &service_names).unwrap(),
             SlashCommand::RestartService("forge_web".to_owned())
         );
         assert_eq!(
-            parse_colon_command(":restart forge_web").unwrap(),
+            parse_colon_command(":restart forge_web", &service_names).unwrap(),
             SlashCommand::RestartService("forge_web".to_owned())
         );
     }
 
     #[test]
     fn parses_start_and_stop_commands() {
+        let service_names = ServiceNames::from_names(["forge_web"]);
         assert_eq!(
-            parse_colon_command(":start-all").unwrap(),
+            parse_colon_command(":start-all", &service_names).unwrap(),
             SlashCommand::StartAll
         );
         assert_eq!(
-            parse_colon_command(":start forge_web").unwrap(),
+            parse_colon_command(":start forge_web", &service_names).unwrap(),
             SlashCommand::StartService("forge_web".to_owned())
         );
         assert_eq!(
-            parse_colon_command(":stop-all").unwrap(),
+            parse_colon_command(":stop-all", &service_names).unwrap(),
             SlashCommand::StopAll
         );
         assert_eq!(
-            parse_colon_command(":stop forge_web").unwrap(),
+            parse_colon_command(":stop forge_web", &service_names).unwrap(),
             SlashCommand::StopService("forge_web".to_owned())
         );
     }
 
     #[test]
     fn autocompletes_command_names() {
-        let services = BTreeMap::new();
+        let service_names = ServiceNames::from_names(std::iter::empty::<&str>());
         assert_eq!(
-            autocomplete_colon_input(":re", &services),
+            autocomplete_colon_input(":re", &service_names),
             Some(":restart ".to_owned())
         );
         assert_eq!(
-            autocomplete_colon_input(":restart-a", &services),
+            autocomplete_colon_input(":restart-a", &service_names),
             Some(":restart-all".to_owned())
         );
         assert_eq!(
-            autocomplete_colon_input(":start-a", &services),
+            autocomplete_colon_input(":start-a", &service_names),
             Some(":start-all".to_owned())
         );
         assert_eq!(
-            autocomplete_colon_input(":stop-a", &services),
+            autocomplete_colon_input(":stop-a", &service_names),
             Some(":stop-all".to_owned())
         );
     }
 
     #[test]
     fn adds_space_after_exact_restart_command() {
-        let services = BTreeMap::new();
+        let service_names = ServiceNames::from_names(std::iter::empty::<&str>());
         assert_eq!(
-            autocomplete_colon_input(":r", &services),
+            autocomplete_colon_input(":r", &service_names),
             Some(":r ".to_owned())
         );
         assert_eq!(
-            autocomplete_colon_input(":start", &services),
+            autocomplete_colon_input(":start", &service_names),
             Some(":start ".to_owned())
         );
         assert_eq!(
-            autocomplete_colon_input(":stop", &services),
+            autocomplete_colon_input(":stop", &service_names),
             Some(":stop ".to_owned())
         );
     }
@@ -990,28 +1327,30 @@ mod tests {
                 sample_service("worker", ServiceState::Running),
             ),
         ]);
+        let service_names = ServiceNames::from_services(&services);
 
         assert_eq!(
-            autocomplete_colon_input(":r wo", &services),
-            Some(":r worker ".to_owned())
+            autocomplete_colon_input(":r w", &service_names),
+            Some(":r w ".to_owned())
         );
         assert_eq!(
-            autocomplete_colon_input(":start wo", &services),
+            autocomplete_colon_input(":start wo", &service_names),
             Some(":start worker ".to_owned())
         );
         assert_eq!(
-            autocomplete_colon_input(":stop wo", &services),
+            autocomplete_colon_input(":stop wo", &service_names),
             Some(":stop worker ".to_owned())
         );
-        assert_eq!(autocomplete_colon_input(":restart ", &services), None);
+        assert_eq!(autocomplete_colon_input(":restart ", &service_names), None);
 
         let single_service = BTreeMap::from([(
             "api".to_owned(),
             sample_service("api", ServiceState::Running),
         )]);
+        let single_service_names = ServiceNames::from_services(&single_service);
         assert_eq!(
-            autocomplete_colon_input(":restart ", &single_service),
-            Some(":restart api ".to_owned())
+            autocomplete_colon_input(":restart ", &single_service_names),
+            Some(":restart a ".to_owned())
         );
     }
 
@@ -1021,7 +1360,52 @@ mod tests {
             "api".to_owned(),
             sample_service("api", ServiceState::Running),
         )]);
-        assert_eq!(autocomplete_colon_input(":r api extra", &services), None);
+        let service_names = ServiceNames::from_services(&services);
+        assert_eq!(
+            autocomplete_colon_input(":r api extra", &service_names),
+            None
+        );
+    }
+
+    #[test]
+    fn computes_unique_service_short_names() {
+        let service_names = ServiceNames::from_names([
+            "db",
+            "forge_auth",
+            "forge_git_worker",
+            "forge_web",
+            "forgecommander",
+        ]);
+
+        assert_eq!(service_names.short_name("db"), "d");
+        assert_eq!(service_names.short_name("forge_auth"), "fa");
+        assert_eq!(service_names.short_name("forge_git_worker"), "fg");
+        assert_eq!(service_names.short_name("forge_web"), "fw");
+        assert_eq!(service_names.short_name("forgecommander"), "fc");
+    }
+
+    #[test]
+    fn parses_service_shorthands() {
+        let service_names = ServiceNames::from_names([
+            "db",
+            "forge_auth",
+            "forge_git_worker",
+            "forge_web",
+            "forgecommander",
+        ]);
+
+        assert_eq!(
+            parse_colon_command(":r fw", &service_names).unwrap(),
+            SlashCommand::RestartService("forge_web".to_owned())
+        );
+        assert_eq!(
+            parse_colon_command(":start fa", &service_names).unwrap(),
+            SlashCommand::StartService("forge_auth".to_owned())
+        );
+        assert_eq!(
+            parse_colon_command(":stop fc", &service_names).unwrap(),
+            SlashCommand::StopService("forgecommander".to_owned())
+        );
     }
 
     #[test]
@@ -1036,27 +1420,57 @@ mod tests {
                 sample_service("worker", ServiceState::Starting),
             ),
         ]);
+        let service_names = ServiceNames::from_services(&services);
 
-        let lines = status_lines(&services, 10, 6);
+        let lines = status_lines(&services, &service_names, 10, 6);
 
         assert_eq!(lines.len(), 2);
         assert_eq!(
             lines[0].segments[0].text,
+            format!("{:width$} ", "running", width = status_width())
+        );
+        assert_eq!(lines[0].segments[0].color, Some(Color::Green));
+        assert!(
+            lines[0]
+                .segments
+                .iter()
+                .any(|segment| segment.text == "a"
+                    && segment.color == Some(SERVICE_SHORT_NAME_COLOR))
+        );
+        assert!(
+            lines[0]
+                .segments
+                .iter()
+                .any(|segment| segment.color == Some(SERVICE_NAME_COLOR))
+        );
+        assert_eq!(
+            lines[0]
+                .segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<String>(),
             format!(
-                "{:width$} {:name_width$} ",
+                "{:width$} {:name_width$} {:>5.1}% {}",
                 "running",
                 "api",
+                12.5,
+                "32.0 MiB",
                 width = status_width(),
                 name_width = 6
             )
         );
-        assert_eq!(lines[0].segments[1].text, " 12.5% 32.0 MiB");
         assert_eq!(
-            lines[1].segments[0].text,
+            lines[1]
+                .segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<String>(),
             format!(
-                "{:width$} {:name_width$} ",
+                "{:width$} {:name_width$} {:>5.1}% {}",
                 "starting",
                 "worker",
+                12.5,
+                "32.0 MiB",
                 width = status_width(),
                 name_width = 6
             )
@@ -1082,16 +1496,23 @@ mod tests {
                 sample_service("web", ServiceState::Running),
             ),
         ]);
+        let service_names = ServiceNames::from_services(&services);
 
-        let lines = status_lines(&services, 2, 3);
+        let lines = status_lines(&services, &service_names, 2, 3);
 
         assert_eq!(lines.len(), 2);
         assert_eq!(
-            lines[0].segments[0].text,
+            lines[0]
+                .segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<String>(),
             format!(
-                "{:width$} {:name_width$} ",
+                "{:width$} {:name_width$} {:>5.1}% {}",
                 "running",
                 "api",
+                12.5,
+                "32.0 MiB",
                 width = status_width(),
                 name_width = 3
             )
