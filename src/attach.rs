@@ -493,31 +493,25 @@ fn build_service_short_names(names: &[String]) -> BTreeMap<String, String> {
 }
 
 fn service_short_name_signature(service_name: &str, all_names: &[String]) -> String {
-    let Some((first_index, first_character)) = first_service_name_character(service_name) else {
-        return String::new();
-    };
-    let first_character_end = first_index + first_character.len_utf8();
     let shared_prefix_len = all_names
         .iter()
         .filter(|other_name| other_name.as_str() != service_name)
-        .map(|other_name| longest_common_prefix_len(service_name, other_name))
+        .map(|other_name| shared_separator_prefix_len(service_name, other_name))
         .max()
         .unwrap_or(0);
 
-    let suffix_source = if shared_prefix_len > 0 {
+    let signature_source = if shared_prefix_len > 0 {
         let distinctive_suffix = trim_leading_non_alphanumeric(&service_name[shared_prefix_len..]);
         if distinctive_suffix.is_empty() {
-            &service_name[first_character_end..]
+            service_name
         } else {
             distinctive_suffix
         }
     } else {
-        &service_name[first_character_end..]
+        service_name
     };
 
-    let mut signature = first_character.to_string();
-    signature.push_str(&sanitize_short_name_fragment(suffix_source));
-    signature
+    sanitize_short_name_fragment(signature_source)
 }
 
 fn shortest_unique_short_name(
@@ -544,11 +538,15 @@ fn shortest_unique_short_name(
     service_name.to_owned()
 }
 
-fn first_service_name_character(service_name: &str) -> Option<(usize, char)> {
-    service_name
+fn shared_separator_prefix_len(left: &str, right: &str) -> usize {
+    let shared_prefix_len = longest_common_prefix_len(left, right);
+    left[..shared_prefix_len]
         .char_indices()
-        .find(|(_, character)| character.is_alphanumeric())
-        .or_else(|| service_name.char_indices().next())
+        .filter_map(|(index, character)| {
+            (!character.is_alphanumeric()).then_some(index + character.len_utf8())
+        })
+        .last()
+        .unwrap_or(0)
 }
 
 fn longest_common_prefix_len(left: &str, right: &str) -> usize {
@@ -889,18 +887,19 @@ fn service_name_segments(
 }
 
 fn highlighted_service_name_characters(service_name: &str, short_name: &str) -> Vec<bool> {
-    let mut highlighted = vec![false; service_name.chars().count()];
-    let mut short_characters = short_name.chars();
-    let mut next_short_character = short_characters.next();
+    let service_characters = service_name.chars().collect::<Vec<_>>();
+    let mut highlighted = vec![false; service_characters.len()];
+    let mut search_end = service_characters.len();
 
-    for (index, character) in service_name.chars().enumerate() {
-        let Some(short_character) = next_short_character else {
-            break;
+    for short_character in short_name.chars().rev() {
+        let Some(index) = service_characters[..search_end]
+            .iter()
+            .rposition(|character| *character == short_character)
+        else {
+            return vec![false; service_characters.len()];
         };
-        if short_character == character {
-            highlighted[index] = true;
-            next_short_character = short_characters.next();
-        }
+        highlighted[index] = true;
+        search_end = index;
     }
 
     highlighted
@@ -1203,8 +1202,9 @@ mod tests {
 
     use super::{
         SERVICE_NAME_COLOR, SERVICE_SHORT_NAME_COLOR, ServiceNames, SlashCommand,
-        autocomplete_colon_input, format_log_prefix, format_memory, parse_colon_command,
-        render_command_prompt, service_rows_for, status_label, status_lines, status_width,
+        autocomplete_colon_input, format_log_prefix, format_memory,
+        highlighted_service_name_characters, parse_colon_command, render_command_prompt,
+        service_rows_for, status_label, status_lines, status_width,
     };
     use crate::ipc::{ServiceSnapshot, ServiceState};
     use crossterm::style::Color;
@@ -1373,10 +1373,10 @@ mod tests {
         ]);
 
         assert_eq!(service_names.short_name("db"), "d");
-        assert_eq!(service_names.short_name("forge_auth"), "fa");
-        assert_eq!(service_names.short_name("forge_git_worker"), "fg");
-        assert_eq!(service_names.short_name("forge_web"), "fw");
-        assert_eq!(service_names.short_name("forgecommander"), "fc");
+        assert_eq!(service_names.short_name("forge_auth"), "a");
+        assert_eq!(service_names.short_name("forge_git_worker"), "g");
+        assert_eq!(service_names.short_name("forge_web"), "w");
+        assert_eq!(service_names.short_name("forgecommander"), "f");
     }
 
     #[test]
@@ -1390,17 +1390,47 @@ mod tests {
         ]);
 
         assert_eq!(
-            parse_colon_command(":r fw", &service_names).unwrap(),
+            parse_colon_command(":r w", &service_names).unwrap(),
             SlashCommand::RestartService("forge_web".to_owned())
         );
         assert_eq!(
-            parse_colon_command(":start fa", &service_names).unwrap(),
+            parse_colon_command(":start a", &service_names).unwrap(),
             SlashCommand::StartService("forge_auth".to_owned())
         );
         assert_eq!(
-            parse_colon_command(":stop fc", &service_names).unwrap(),
+            parse_colon_command(":stop f", &service_names).unwrap(),
             SlashCommand::StopService("forgecommander".to_owned())
         );
+    }
+
+    #[test]
+    fn keeps_prefix_based_short_names_for_plain_shared_prefixes() {
+        let service_names = ServiceNames::from_names(["api", "auth", "worker"]);
+
+        assert_eq!(service_names.short_name("api"), "ap");
+        assert_eq!(service_names.short_name("auth"), "au");
+        assert_eq!(service_names.short_name("worker"), "w");
+    }
+
+    #[test]
+    fn keeps_deterministic_prefixes_for_long_plain_shared_prefixes() {
+        let service_names = ServiceNames::from_names(["forgecommander", "forgeconnect", "worker"]);
+
+        assert_eq!(service_names.short_name("forgecommander"), "forgecom");
+        assert_eq!(service_names.short_name("forgeconnect"), "forgecon");
+        assert_eq!(service_names.short_name("worker"), "w");
+    }
+
+    #[test]
+    fn highlights_trimmed_prefix_short_names_at_their_rightmost_match() {
+        let highlighted = highlighted_service_name_characters("forge_git_worker", "g");
+        let highlighted_positions = highlighted
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, is_highlighted)| is_highlighted.then_some(index))
+            .collect::<Vec<_>>();
+
+        assert_eq!(highlighted_positions, vec![6]);
     }
 
     #[test]
