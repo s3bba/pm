@@ -170,7 +170,7 @@ impl AttachTerminal {
         )?;
         for segment in format_log_prefix_segments(
             &entry.service,
-            service_names.short_name(&entry.service),
+            service_names.highlighted_characters(&entry.service),
             self.max_name_width,
         ) {
             if let Some(color) = segment.color {
@@ -390,6 +390,7 @@ enum SlashCommand {
     StopService(String),
     StartAll,
     StartService(String),
+    Quit,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -403,16 +404,34 @@ const COMMAND_ALIASES: &[(&str, SlashArgKind)] = &[
     ("restart-all", SlashArgKind::None),
     ("r", SlashArgKind::Service),
     ("restart", SlashArgKind::Service),
-    ("stop-all", SlashArgKind::None),
-    ("stop", SlashArgKind::Service),
-    ("start-all", SlashArgKind::None),
-    ("start", SlashArgKind::Service),
+    ("da", SlashArgKind::None),
+    ("down-all", SlashArgKind::None),
+    ("d", SlashArgKind::Service),
+    ("down", SlashArgKind::Service),
+    ("q", SlashArgKind::None),
+    ("quit", SlashArgKind::None),
+    ("ua", SlashArgKind::None),
+    ("up-all", SlashArgKind::None),
+    ("u", SlashArgKind::Service),
+    ("up", SlashArgKind::Service),
 ];
 
 #[derive(Debug, Clone)]
 struct ServiceNames {
-    short_by_full: BTreeMap<String, String>,
+    short_by_full: BTreeMap<String, ServiceShortName>,
     full_by_short: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct ServiceShortName {
+    short_name: String,
+    highlighted_characters: Vec<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct ServiceShortNameSignature {
+    text: String,
+    character_indices: Vec<usize>,
 }
 
 impl ServiceNames {
@@ -425,7 +444,7 @@ impl ServiceNames {
         let short_by_full = build_service_short_names(&names);
         let full_by_short = short_by_full
             .iter()
-            .map(|(full_name, short_name)| (short_name.clone(), full_name.clone()))
+            .map(|(full_name, short_name)| (short_name.short_name.clone(), full_name.clone()))
             .collect();
         Self {
             short_by_full,
@@ -436,8 +455,15 @@ impl ServiceNames {
     fn short_name<'a>(&'a self, full_name: &str) -> &'a str {
         self.short_by_full
             .get(full_name)
-            .map(String::as_str)
+            .map(|short_name| short_name.short_name.as_str())
             .unwrap_or("")
+    }
+
+    fn highlighted_characters<'a>(&'a self, full_name: &str) -> &'a [bool] {
+        self.short_by_full
+            .get(full_name)
+            .map(|short_name| short_name.highlighted_characters.as_slice())
+            .unwrap_or(&[])
     }
 
     fn resolve<'a>(&'a self, token: &str) -> Option<&'a str> {
@@ -475,7 +501,7 @@ impl ServiceNames {
     }
 }
 
-fn build_service_short_names(names: &[String]) -> BTreeMap<String, String> {
+fn build_service_short_names(names: &[String]) -> BTreeMap<String, ServiceShortName> {
     let signatures = names
         .iter()
         .map(|name| (name.clone(), service_short_name_signature(name, names)))
@@ -492,7 +518,10 @@ fn build_service_short_names(names: &[String]) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn service_short_name_signature(service_name: &str, all_names: &[String]) -> String {
+fn service_short_name_signature(
+    service_name: &str,
+    all_names: &[String],
+) -> ServiceShortNameSignature {
     let shared_prefix_len = all_names
         .iter()
         .filter(|other_name| other_name.as_str() != service_name)
@@ -500,42 +529,48 @@ fn service_short_name_signature(service_name: &str, all_names: &[String]) -> Str
         .max()
         .unwrap_or(0);
 
-    let signature_source = if shared_prefix_len > 0 {
-        let distinctive_suffix = trim_leading_non_alphanumeric(&service_name[shared_prefix_len..]);
-        if distinctive_suffix.is_empty() {
-            service_name
-        } else {
-            distinctive_suffix
-        }
+    let signature_start = if shared_prefix_len > 0 {
+        leading_alphanumeric_index(&service_name[shared_prefix_len..])
+            .map(|offset| shared_prefix_len + offset)
+            .unwrap_or(0)
     } else {
-        service_name
+        0
     };
 
-    sanitize_short_name_fragment(signature_source)
+    sanitize_short_name_fragment(service_name, signature_start)
 }
 
 fn shortest_unique_short_name(
     service_name: &str,
-    signature: &str,
-    signatures: &BTreeMap<String, String>,
+    signature: &ServiceShortNameSignature,
+    signatures: &BTreeMap<String, ServiceShortNameSignature>,
     full_names: &BTreeSet<&str>,
-) -> String {
+) -> ServiceShortName {
     let mut candidate = String::new();
-    for character in signature.chars() {
+    for (index, character) in signature.text.chars().enumerate() {
         candidate.push(character);
 
         let conflicts_with_full_name =
             candidate != service_name && full_names.contains(candidate.as_str());
         let conflicts_with_other_signature = candidate != service_name
             && signatures.iter().any(|(other_name, other_signature)| {
-                other_name != service_name && other_signature.starts_with(&candidate)
+                other_name != service_name && other_signature.text.starts_with(&candidate)
             });
         if !conflicts_with_full_name && !conflicts_with_other_signature {
-            return candidate;
+            return ServiceShortName {
+                short_name: candidate,
+                highlighted_characters: highlighted_character_mask(
+                    service_name,
+                    &signature.character_indices[..=index],
+                ),
+            };
         }
     }
 
-    service_name.to_owned()
+    ServiceShortName {
+        short_name: service_name.to_owned(),
+        highlighted_characters: vec![true; service_name.chars().count()],
+    }
 }
 
 fn shared_separator_prefix_len(left: &str, right: &str) -> usize {
@@ -560,21 +595,42 @@ fn longest_common_prefix_len(left: &str, right: &str) -> usize {
     matched_bytes
 }
 
-fn trim_leading_non_alphanumeric(value: &str) -> &str {
-    let Some((index, _)) = value
+fn leading_alphanumeric_index(value: &str) -> Option<usize> {
+    value
         .char_indices()
         .find(|(_, character)| character.is_alphanumeric())
-    else {
-        return "";
-    };
-    &value[index..]
+        .map(|(index, _)| index)
 }
 
-fn sanitize_short_name_fragment(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| character.is_alphanumeric())
-        .collect()
+fn sanitize_short_name_fragment(
+    service_name: &str,
+    start_byte: usize,
+) -> ServiceShortNameSignature {
+    let mut text = String::new();
+    let mut character_indices = Vec::new();
+
+    for (character_index, (byte_index, character)) in service_name.char_indices().enumerate() {
+        if byte_index < start_byte || !character.is_alphanumeric() {
+            continue;
+        }
+        text.push(character);
+        character_indices.push(character_index);
+    }
+
+    ServiceShortNameSignature {
+        text,
+        character_indices,
+    }
+}
+
+fn highlighted_character_mask(service_name: &str, highlighted_indices: &[usize]) -> Vec<bool> {
+    let mut highlighted = vec![false; service_name.chars().count()];
+    for &index in highlighted_indices {
+        if let Some(character) = highlighted.get_mut(index) {
+            *character = true;
+        }
+    }
+    highlighted
 }
 
 fn autocomplete_colon_input(buffer: &str, service_names: &ServiceNames) -> Option<String> {
@@ -758,7 +814,7 @@ fn status_lines(
             }];
             segments.extend(service_name_segments(
                 &service.name,
-                service_names.short_name(&service.name),
+                service_names.highlighted_characters(&service.name),
                 0,
                 name_width.saturating_sub(service.name.len()),
                 " ",
@@ -817,12 +873,12 @@ pub fn format_log_prefix(service_name: &str, max_name_width: usize) -> String {
 
 fn format_log_prefix_segments(
     service_name: &str,
-    short_name: &str,
+    highlighted_characters: &[bool],
     max_name_width: usize,
 ) -> Vec<StatusSegment> {
     service_name_segments(
         service_name,
-        short_name,
+        highlighted_characters,
         max_name_width.saturating_sub(service_name.len()),
         0,
         ">  ",
@@ -831,7 +887,7 @@ fn format_log_prefix_segments(
 
 fn service_name_segments(
     service_name: &str,
-    short_name: &str,
+    highlighted_characters: &[bool],
     left_padding: usize,
     right_padding: usize,
     suffix: &str,
@@ -844,16 +900,17 @@ fn service_name_segments(
         });
     }
 
-    let highlighted_characters = highlighted_service_name_characters(service_name, short_name);
     let mut current_color = Some(SERVICE_NAME_COLOR);
     let mut current_text = String::new();
 
     for (index, character) in service_name.chars().enumerate() {
-        let color = Some(if highlighted_characters[index] {
-            SERVICE_SHORT_NAME_COLOR
-        } else {
-            SERVICE_NAME_COLOR
-        });
+        let color = Some(
+            if highlighted_characters.get(index).copied().unwrap_or(false) {
+                SERVICE_SHORT_NAME_COLOR
+            } else {
+                SERVICE_NAME_COLOR
+            },
+        );
         if !current_text.is_empty() && color != current_color {
             segments.push(StatusSegment {
                 text: std::mem::take(&mut current_text),
@@ -884,25 +941,6 @@ fn service_name_segments(
     }
 
     segments
-}
-
-fn highlighted_service_name_characters(service_name: &str, short_name: &str) -> Vec<bool> {
-    let service_characters = service_name.chars().collect::<Vec<_>>();
-    let mut highlighted = vec![false; service_characters.len()];
-    let mut search_end = service_characters.len();
-
-    for short_character in short_name.chars().rev() {
-        let Some(index) = service_characters[..search_end]
-            .iter()
-            .rposition(|character| *character == short_character)
-        else {
-            return vec![false; service_characters.len()];
-        };
-        highlighted[index] = true;
-        search_end = index;
-    }
-
-    highlighted
 }
 
 fn truncate_ascii(value: &str, max_len: usize) -> String {
@@ -979,7 +1017,7 @@ async fn handle_input_event(
                     handle_status_key(key_event, input_mode, terminal, services, service_names)
                 }
                 InputMode::Command(buffer) => {
-                    handle_command_key(
+                    let action = handle_command_key(
                         key_event,
                         buffer,
                         terminal,
@@ -991,7 +1029,7 @@ async fn handle_input_event(
                     if buffer.is_empty() {
                         *input_mode = InputMode::Status;
                     }
-                    Ok(AttachAction::Continue)
+                    Ok(action)
                 }
             }
         }
@@ -1019,7 +1057,7 @@ async fn handle_command_key(
     services: &BTreeMap<String, ServiceSnapshot>,
     service_names: &ServiceNames,
     socket_path: &Path,
-) -> Result<()> {
+) -> Result<AttachAction> {
     match key_event.code {
         KeyCode::Esc => {
             buffer.clear();
@@ -1045,10 +1083,11 @@ async fn handle_command_key(
             terminal.draw_status(services, service_names)?;
 
             if command_input == ":" || command_input.is_empty() {
-                return Ok(());
+                return Ok(AttachAction::Continue);
             }
 
             let line = match parse_colon_command(&command_input, service_names) {
+                Ok(SlashCommand::Quit) => return Ok(AttachAction::Exit),
                 Ok(command) => match execute_slash_command(socket_path, command).await {
                     Ok(message) => message,
                     Err(error) => format!("command failed: {error}"),
@@ -1072,7 +1111,7 @@ async fn handle_command_key(
         }
         _ => {}
     }
-    Ok(())
+    Ok(AttachAction::Continue)
 }
 
 fn parse_colon_command(input: &str, service_names: &ServiceNames) -> Result<SlashCommand> {
@@ -1099,26 +1138,32 @@ fn parse_colon_command(input: &str, service_names: &ServiceNames) -> Result<Slas
             (None, None) => bail!("`:{name}` requires a service name"),
             _ => bail!("`:{name}` accepts exactly one service name"),
         },
-        "stop-all" => {
+        "da" | "down-all" => {
             if parts.next().is_some() {
                 bail!("`:{name}` does not take arguments");
             }
             Ok(SlashCommand::StopAll)
         }
-        "stop" => match (parts.next(), parts.next()) {
+        "d" | "down" => match (parts.next(), parts.next()) {
             (Some(service), None) => Ok(SlashCommand::StopService(
                 resolve_service_token(service, service_names)?.to_owned(),
             )),
             (None, None) => bail!("`:{name}` requires a service name"),
             _ => bail!("`:{name}` accepts exactly one service name"),
         },
-        "start-all" => {
+        "q" | "quit" => {
+            if parts.next().is_some() {
+                bail!("`:{name}` does not take arguments");
+            }
+            Ok(SlashCommand::Quit)
+        }
+        "ua" | "up-all" => {
             if parts.next().is_some() {
                 bail!("`:{name}` does not take arguments");
             }
             Ok(SlashCommand::StartAll)
         }
-        "start" => match (parts.next(), parts.next()) {
+        "u" | "up" => match (parts.next(), parts.next()) {
             (Some(service), None) => Ok(SlashCommand::StartService(
                 resolve_service_token(service, service_names)?.to_owned(),
             )),
@@ -1158,6 +1203,7 @@ async fn execute_slash_command(socket_path: &Path, command: SlashCommand) -> Res
             service,
             action: ProcessAction::Start,
         },
+        SlashCommand::Quit => bail!("quit is handled locally"),
     };
     match request_response(socket_path, &message).await? {
         ServerMessage::Ack { message } => Ok(message),
@@ -1202,9 +1248,8 @@ mod tests {
 
     use super::{
         SERVICE_NAME_COLOR, SERVICE_SHORT_NAME_COLOR, ServiceNames, SlashCommand,
-        autocomplete_colon_input, format_log_prefix, format_memory,
-        highlighted_service_name_characters, parse_colon_command, render_command_prompt,
-        service_rows_for, status_label, status_lines, status_width,
+        autocomplete_colon_input, format_log_prefix, format_memory, parse_colon_command,
+        render_command_prompt, service_rows_for, status_label, status_lines, status_width,
     };
     use crate::ipc::{ServiceSnapshot, ServiceState};
     use crossterm::style::Color;
@@ -1255,20 +1300,49 @@ mod tests {
     fn parses_start_and_stop_commands() {
         let service_names = ServiceNames::from_names(["forge_web"]);
         assert_eq!(
-            parse_colon_command(":start-all", &service_names).unwrap(),
+            parse_colon_command(":up-all", &service_names).unwrap(),
             SlashCommand::StartAll
         );
         assert_eq!(
-            parse_colon_command(":start forge_web", &service_names).unwrap(),
+            parse_colon_command(":ua", &service_names).unwrap(),
+            SlashCommand::StartAll
+        );
+        assert_eq!(
+            parse_colon_command(":up forge_web", &service_names).unwrap(),
             SlashCommand::StartService("forge_web".to_owned())
         );
         assert_eq!(
-            parse_colon_command(":stop-all", &service_names).unwrap(),
+            parse_colon_command(":u forge_web", &service_names).unwrap(),
+            SlashCommand::StartService("forge_web".to_owned())
+        );
+        assert_eq!(
+            parse_colon_command(":down-all", &service_names).unwrap(),
             SlashCommand::StopAll
         );
         assert_eq!(
-            parse_colon_command(":stop forge_web", &service_names).unwrap(),
+            parse_colon_command(":da", &service_names).unwrap(),
+            SlashCommand::StopAll
+        );
+        assert_eq!(
+            parse_colon_command(":down forge_web", &service_names).unwrap(),
             SlashCommand::StopService("forge_web".to_owned())
+        );
+        assert_eq!(
+            parse_colon_command(":d forge_web", &service_names).unwrap(),
+            SlashCommand::StopService("forge_web".to_owned())
+        );
+    }
+
+    #[test]
+    fn parses_quit_commands() {
+        let service_names = ServiceNames::from_names(std::iter::empty::<&str>());
+        assert_eq!(
+            parse_colon_command(":quit", &service_names).unwrap(),
+            SlashCommand::Quit
+        );
+        assert_eq!(
+            parse_colon_command(":q", &service_names).unwrap(),
+            SlashCommand::Quit
         );
     }
 
@@ -1284,12 +1358,16 @@ mod tests {
             Some(":restart-all".to_owned())
         );
         assert_eq!(
-            autocomplete_colon_input(":start-a", &service_names),
-            Some(":start-all".to_owned())
+            autocomplete_colon_input(":up-a", &service_names),
+            Some(":up-all".to_owned())
         );
         assert_eq!(
-            autocomplete_colon_input(":stop-a", &service_names),
-            Some(":stop-all".to_owned())
+            autocomplete_colon_input(":down-a", &service_names),
+            Some(":down-all".to_owned())
+        );
+        assert_eq!(
+            autocomplete_colon_input(":qu", &service_names),
+            Some(":quit".to_owned())
         );
     }
 
@@ -1301,12 +1379,28 @@ mod tests {
             Some(":r ".to_owned())
         );
         assert_eq!(
-            autocomplete_colon_input(":start", &service_names),
-            Some(":start ".to_owned())
+            autocomplete_colon_input(":u", &service_names),
+            Some(":u ".to_owned())
         );
         assert_eq!(
-            autocomplete_colon_input(":stop", &service_names),
-            Some(":stop ".to_owned())
+            autocomplete_colon_input(":up", &service_names),
+            Some(":up ".to_owned())
+        );
+        assert_eq!(
+            autocomplete_colon_input(":d", &service_names),
+            Some(":d ".to_owned())
+        );
+        assert_eq!(
+            autocomplete_colon_input(":down", &service_names),
+            Some(":down ".to_owned())
+        );
+        assert_eq!(
+            autocomplete_colon_input(":q", &service_names),
+            None
+        );
+        assert_eq!(
+            autocomplete_colon_input(":quit", &service_names),
+            None
         );
     }
 
@@ -1329,12 +1423,12 @@ mod tests {
             Some(":r w ".to_owned())
         );
         assert_eq!(
-            autocomplete_colon_input(":start wo", &service_names),
-            Some(":start worker ".to_owned())
+            autocomplete_colon_input(":up wo", &service_names),
+            Some(":up worker ".to_owned())
         );
         assert_eq!(
-            autocomplete_colon_input(":stop wo", &service_names),
-            Some(":stop worker ".to_owned())
+            autocomplete_colon_input(":down wo", &service_names),
+            Some(":down worker ".to_owned())
         );
         assert_eq!(autocomplete_colon_input(":restart ", &service_names), None);
 
@@ -1346,6 +1440,10 @@ mod tests {
         assert_eq!(
             autocomplete_colon_input(":restart ", &single_service_names),
             Some(":restart a ".to_owned())
+        );
+        assert_eq!(
+            autocomplete_colon_input(":up ", &single_service_names),
+            Some(":up a ".to_owned())
         );
     }
 
@@ -1394,11 +1492,11 @@ mod tests {
             SlashCommand::RestartService("forge_web".to_owned())
         );
         assert_eq!(
-            parse_colon_command(":start a", &service_names).unwrap(),
+            parse_colon_command(":u a", &service_names).unwrap(),
             SlashCommand::StartService("forge_auth".to_owned())
         );
         assert_eq!(
-            parse_colon_command(":stop f", &service_names).unwrap(),
+            parse_colon_command(":d f", &service_names).unwrap(),
             SlashCommand::StopService("forgecommander".to_owned())
         );
     }
@@ -1422,14 +1520,29 @@ mod tests {
     }
 
     #[test]
-    fn highlights_trimmed_prefix_short_names_at_their_rightmost_match() {
-        let highlighted = highlighted_service_name_characters("forge_git_worker", "g");
+    fn highlights_exact_positions_for_trimmed_prefix_short_names() {
+        let service_names = ServiceNames::from_names(["forge_git_worker", "forge_web"]);
+        let highlighted = service_names.highlighted_characters("forge_git_worker");
         let highlighted_positions = highlighted
-            .into_iter()
+            .iter()
             .enumerate()
             .filter_map(|(index, is_highlighted)| is_highlighted.then_some(index))
             .collect::<Vec<_>>();
 
+        assert_eq!(highlighted_positions, vec![6]);
+    }
+
+    #[test]
+    fn highlights_the_first_character_of_the_distinctive_suffix() {
+        let service_names = ServiceNames::from_names(["forge_repository", "forge_web"]);
+        let highlighted = service_names.highlighted_characters("forge_repository");
+        let highlighted_positions = highlighted
+            .iter()
+            .enumerate()
+            .filter_map(|(index, is_highlighted)| is_highlighted.then_some(index))
+            .collect::<Vec<_>>();
+
+        assert_eq!(service_names.short_name("forge_repository"), "r");
         assert_eq!(highlighted_positions, vec![6]);
     }
 
